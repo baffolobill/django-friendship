@@ -1,39 +1,48 @@
-from django.db import models
+from __future__ import unicode_literals
+
 from django.conf import settings
-from django.db.models import Q
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
 
 from django.utils import timezone
+from django.utils.encoding import python_2_unicode_compatible
 from django.utils.translation import ugettext_lazy as _
 
+from mongoengine import fields, signals, Document
+from mongoengine.queryset import Q, QuerySet
+
+from friendship.settings import (USE_NOTIFICATION_APP,
+    NOTIFY_ABOUT_NEW_FRIENDS_OF_FRIEND, NOTIFY_ABOUT_FRIENDS_REMOVAL)
+from friendship.compat import get_user_model
 from friendship.exceptions import AlreadyExistsError
-from friendship.signals import friendship_request_created, \
+from friendship.signals import (friendship_request_created, \
     friendship_request_rejected, friendship_request_canceled, \
     friendship_request_viewed, friendship_request_accepted, \
-    friendship_removed, follower_created, following_created, follower_removed,\
-    following_removed
+    friendship_removed, inspirations_created, inspirationals_created,
+    inspirations_removed, inspirationals_removed, blocking_created,
+    blocking_removed)
 
-AUTH_USER_MODEL = getattr(settings, 'AUTH_USER_MODEL', 'auth.User')
+
 
 CACHE_TYPES = {
-    'friends': 'f-%d',
-    'followers': 'fo-%d',
-    'following': 'fl-%d',
-    'requests': 'fr-%d',
-    'sent_requests': 'sfr-%d',
-    'unread_requests': 'fru-%d',
-    'unread_request_count': 'fruc-%d',
-    'read_requests': 'frr-%d',
-    'rejected_requests': 'frj-%d',
-    'unrejected_requests': 'frur-%d',
-    'unrejected_request_count': 'frurc-%d',
+    'friends': 'f-%s',
+    'inspirations': 'ifo-%s',
+    'inspirationals': 'ifl-%s',
+    'requests': 'fr-%s',
+    'sent_requests': 'sfr-%s',
+    'unread_requests': 'fru-%s',
+    'unread_request_count': 'fruc-%s',
+    'read_requests': 'frr-%s',
+    'rejected_requests': 'frj-%s',
+    'unrejected_requests': 'frur-%s',
+    'unrejected_request_count': 'frurc-%s',
+    'blocked': 'bl-%s',
 }
 
 BUST_CACHES = {
     'friends': ['friends'],
-    'followers': ['followers'],
-    'following': ['following'],
+    'inspirations': ['inspirations'],
+    'inspirationals': ['inspirationals'],
     'requests': [
         'requests',
         'unread_requests',
@@ -44,43 +53,47 @@ BUST_CACHES = {
         'unrejected_request_count',
     ],
     'sent_requests': ['sent_requests'],
+    'blocked': ['blocked'],
 }
 
 
-def cache_key(type, user_pk):
+def cache_key(kind, user_pk):
     """
-    Build the cache key for a particular type of cached value
+    Build the cache key for a particular kind of cached value
     """
-    return CACHE_TYPES[type] % user_pk
+    return CACHE_TYPES[kind] % user_pk
 
 
-def bust_cache(type, user_pk):
+def bust_cache(kind, user_pk):
     """
-    Bust our cache for a given type, can bust multiple caches
+    Bust our cache for a given kind, can bust multiple caches
     """
-    bust_keys = BUST_CACHES[type]
+    bust_keys = BUST_CACHES[kind]
     keys = [CACHE_TYPES[k] % user_pk for k in bust_keys]
     cache.delete_many(keys)
 
 
-class FriendshipRequest(models.Model):
+@python_2_unicode_compatible
+class FriendshipRequest(Document):
     """ Model to represent friendship requests """
-    from_user = models.ForeignKey(AUTH_USER_MODEL, related_name='friendship_requests_sent')
-    to_user = models.ForeignKey(AUTH_USER_MODEL, related_name='friendship_requests_received')
+    from_user = fields.ReferenceField(get_user_model())
+    to_user = fields.ReferenceField(get_user_model(), unique_with=['from_user'])
 
-    message = models.TextField(_('Message'), blank=True)
+    message = fields.StringField(
+        verbose_name=_('Message'),
+        max_length=1000,
+        required=False)
 
-    created = models.DateTimeField(default=timezone.now)
-    rejected = models.DateTimeField(blank=True, null=True)
-    viewed = models.DateTimeField(blank=True, null=True)
+    created = fields.DateTimeField(default=timezone.now, null=True)
+    rejected = fields.DateTimeField(required=False, null=True)
+    viewed = fields.DateTimeField(required=False, null=True)
 
     class Meta:
         verbose_name = _('Friendship Request')
         verbose_name_plural = _('Friendship Requests')
-        unique_together = ('from_user', 'to_user')
 
-    def __unicode__(self):
-        return "User #%d friendship requested #%d" % (self.from_user_id, self.to_user_id)
+    def __str__(self):
+        return "User #%s friendship requested #%s" % (self.from_user.pk, self.to_user.pk)
 
     def accept(self):
         """ Accept this friendship request """
@@ -143,7 +156,7 @@ class FriendshipRequest(models.Model):
         return True
 
 
-class FriendshipManager(models.Manager):
+class FriendshipQuerySet(QuerySet):
     """ Friendship manager """
 
     def friends(self, user):
@@ -152,8 +165,8 @@ class FriendshipManager(models.Manager):
         friends = cache.get(key)
 
         if friends is None:
-            qs = Friend.objects.select_related('from_user', 'to_user').filter(to_user=user).all()
-            friends = [u.from_user for u in qs]
+            qs = Friend.objects.filter(from_user=user).select_related(max_depth=2)
+            friends = [u.to_user for u in qs]
             cache.set(key, friends)
 
         return friends
@@ -164,8 +177,8 @@ class FriendshipManager(models.Manager):
         requests = cache.get(key)
 
         if requests is None:
-            qs = FriendshipRequest.objects.select_related('from_user', 'to_user').filter(
-                to_user=user).all()
+            qs = FriendshipRequest.objects.filter(
+                to_user=user).select_related(max_depth=2)
             requests = list(qs)
             cache.set(key, requests)
 
@@ -177,8 +190,8 @@ class FriendshipManager(models.Manager):
         requests = cache.get(key)
 
         if requests is None:
-            qs = FriendshipRequest.objects.select_related('from_user', 'to_user').filter(
-                from_user=user).all()
+            qs = FriendshipRequest.objects.filter(
+                from_user=user).select_related(max_depth=2)
             requests = list(qs)
             cache.set(key, requests)
 
@@ -190,9 +203,9 @@ class FriendshipManager(models.Manager):
         unread_requests = cache.get(key)
 
         if unread_requests is None:
-            qs = FriendshipRequest.objects.select_related('from_user', 'to_user').filter(
+            qs = FriendshipRequest.objects.filter(
                 to_user=user,
-                viewed__isnull=True).all()
+                viewed=None).select_related(max_depth=2)
             unread_requests = list(qs)
             cache.set(key, unread_requests)
 
@@ -204,9 +217,9 @@ class FriendshipManager(models.Manager):
         count = cache.get(key)
 
         if count is None:
-            count = FriendshipRequest.objects.select_related('from_user', 'to_user').filter(
+            count = FriendshipRequest.objects.filter(
                 to_user=user,
-                viewed__isnull=True).count()
+                viewed=None).count()
             cache.set(key, count)
 
         return count
@@ -217,9 +230,9 @@ class FriendshipManager(models.Manager):
         read_requests = cache.get(key)
 
         if read_requests is None:
-            qs = FriendshipRequest.objects.select_related('from_user', 'to_user').filter(
+            qs = FriendshipRequest.objects.filter(
                 to_user=user,
-                viewed__isnull=False).all()
+                viewed__ne=None).select_related(max_depth=2)
             read_requests = list(qs)
             cache.set(key, read_requests)
 
@@ -231,9 +244,9 @@ class FriendshipManager(models.Manager):
         rejected_requests = cache.get(key)
 
         if rejected_requests is None:
-            qs = FriendshipRequest.objects.select_related('from_user', 'to_user').filter(
+            qs = FriendshipRequest.objects.filter(
                 to_user=user,
-                rejected__isnull=False).all()
+                rejected__ne=None).select_related(max_depth=2)
             rejected_requests = list(qs)
             cache.set(key, rejected_requests)
 
@@ -245,9 +258,9 @@ class FriendshipManager(models.Manager):
         unrejected_requests = cache.get(key)
 
         if unrejected_requests is None:
-            qs = FriendshipRequest.objects.select_related('from_user', 'to_user').filter(
+            qs = FriendshipRequest.objects.filter(
                 to_user=user,
-                rejected__isnull=True).all()
+                rejected=None).select_related(max_depth=2)
             unrejected_requests = list(qs)
             cache.set(key, unrejected_requests)
 
@@ -259,9 +272,9 @@ class FriendshipManager(models.Manager):
         count = cache.get(key)
 
         if count is None:
-            count = FriendshipRequest.objects.select_related('from_user', 'to_user').filter(
+            count = FriendshipRequest.objects.filter(
                 to_user=user,
-                rejected__isnull=True).count()
+                rejected=None).count()
             cache.set(key, count)
 
         return count
@@ -269,19 +282,40 @@ class FriendshipManager(models.Manager):
     def add_friend(self, from_user, to_user, message=None):
         """ Create a friendship request """
         if from_user == to_user:
-            raise ValidationError("Users cannot be friends with themselves")
+            raise ValidationError(_("Users cannot be friends with themselves"))
+
+        blocked = Blocking.objects.is_blocked(from_user=to_user, to_user=from_user)
+        if blocked:
+            raise ValidationError(
+                _("You can't invite %(display_name)s to friends.") % {
+                    'display_name': to_user.get_display_name()
+                }
+            )
+
+        # remove any existent blocking
+        is_user_was_blocked = Blocking.objects.remove_blocking(
+                                    from_user=from_user, to_user=to_user)
 
         if message is None:
             message = ''
 
-        request, created = FriendshipRequest.objects.get_or_create(
+        request = FriendshipRequest.objects(
             from_user=from_user,
             to_user=to_user,
-            message=message,
-        )
+        ).modify(upsert=True, new=False, set__from_user=from_user,
+                set__to_user=to_user, set__message=message, set__created=timezone.now())
 
-        if created is False:
+        if request is not None and not is_user_was_blocked:
             raise AlreadyExistsError("Friendship already requested")
+
+        if request is None:
+            request = FriendshipRequest.objects(
+                from_user=from_user,
+                to_user=to_user).first()
+        else:
+            request.rejected = None
+            request.viewed = None
+            request.save()
 
         bust_cache('requests', to_user.pk)
         bust_cache('sent_requests', from_user.pk)
@@ -295,14 +329,20 @@ class FriendshipManager(models.Manager):
             qs = Friend.objects.filter(
                 Q(to_user=to_user, from_user=from_user) |
                 Q(to_user=from_user, from_user=to_user)
-            ).distinct().all()
+            )
 
             if qs:
-                friendship_removed.send(
-                    sender=qs[0],
-                    from_user=from_user,
-                    to_user=to_user
-                )
+                for qs_ in list(qs):
+                    kw = {'from_user': None, 'to_user': None}
+                    if qs_.from_user == from_user:
+                        kw = {'from_user': from_user, 'to_user': to_user}
+                    elif qs_.from_user == to_user:
+                        kw = {'from_user': to_user, 'to_user': from_user}
+                    else:
+                        raise ValueError('None of from_user and to_user found in queryset.')
+
+                    kw['sender'] = qs_
+                    friendship_removed.send(**kw)
                 qs.delete()
                 bust_cache('friends', to_user.pk)
                 bust_cache('friends', from_user.pk)
@@ -328,122 +368,340 @@ class FriendshipManager(models.Manager):
                 return False
 
 
-class Friend(models.Model):
-    """ Model to represent Friendships """
-    to_user = models.ForeignKey(AUTH_USER_MODEL, related_name='friends')
-    from_user = models.ForeignKey(AUTH_USER_MODEL, related_name='_unused_friend_relation')
-    created = models.DateTimeField(default=timezone.now)
+@python_2_unicode_compatible
+class Friend(Document):
+    """
+    Document to represent Friendships
 
-    objects = FriendshipManager()
+    Important! Please note, that (from_user=User1, to_user=User2)
+        and (from_user=User2, to_user=User1) are not the same!
+    """
+    from_user = fields.ReferenceField(get_user_model())
+    to_user = fields.ReferenceField(get_user_model(), unique_with='from_user')
+    created = fields.DateTimeField(default=timezone.now, null=True)
+    #tags = fields.ListField(fields.StringField(), required=False)
+
+    meta = {
+        'indexes': [
+            'to_user',
+            'from_user',
+            ('from_user', 'to_user'),
+        ],
+        'queryset_class': FriendshipQuerySet
+    }
 
     class Meta:
         verbose_name = _('Friend')
         verbose_name_plural = _('Friends')
-        unique_together = ('from_user', 'to_user')
 
-    def __unicode__(self):
-        return "User #%d is friends with #%d" % (self.to_user_id, self.from_user_id)
+    def __str__(self):
+        return "User #%s is friends with #%s" % (self.to_user.pk, self.from_user.pk)
 
     def save(self, *args, **kwargs):
         # Ensure users can't be friends with themselves
         if self.to_user == self.from_user:
             raise ValidationError("Users cannot be friends with themselves.")
-        super(Friend, self).save(*args, **kwargs)
+        return super(Friend, self).save(*args, **kwargs)
 
 
-class FollowingManager(models.Manager):
-    """ Following manager """
+class InspirationQuerySet(QuerySet):
+    """ Inspiration manager """
 
-    def followers(self, user):
-        """ Return a list of all followers """
-        key = cache_key('followers', user.pk)
-        followers = cache.get(key)
+    def inspired_by_user(self, user):
+        """ Return a list of all inspirations """
+        key = cache_key('inspirations', user.pk)
+        inspirations = cache.get(key)
 
-        if followers is None:
-            qs = Follow.objects.filter(followee=user).all()
-            followers = [u.follower for u in qs]
-            cache.set(key, followers)
+        if inspirations is None:
+            qs = Inspiration.objects.filter(inspired_by=user).select_related(max_depth=2)
+            inspirations = [u.user for u in qs]
+            cache.set(key, inspirations)
 
-        return followers
+        return inspirations
 
-    def following(self, user):
+    def user_inspired_by(self, user):
         """ Return a list of all users the given user follows """
-        key = cache_key('following', user.pk)
-        following = cache.get(key)
+        key = cache_key('inspirationals', user.pk)
+        inspirationals = cache.get(key)
 
-        if following is None:
-            qs = Follow.objects.filter(follower=user).all()
-            following = [u.followee for u in qs]
-            cache.set(key, following)
+        if inspirationals is None:
+            qs = Inspiration.objects.filter(user=user).select_related(max_depth=2)
+            inspirationals = [u.inspired_by for u in qs]
+            cache.set(key, inspirationals)
 
-        return following
+        return inspirationals
 
-    def add_follower(self, follower, followee):
-        """ Create 'follower' follows 'followee' relationship """
-        if follower == followee:
-            raise ValidationError("Users cannot follow themselves")
+    def add_inspiration(self, user, inspired_by):
+        """ Create 'user' inspired by 'inspired_by' relationship """
+        if user == inspired_by:
+            raise ValidationError("Users cannot inspire themselves")
 
-        relation, created = Follow.objects.get_or_create(follower=follower, followee=followee)
+        relation = Inspiration.objects(user=user, inspired_by=inspired_by)\
+            .modify(new=False, upsert=True, set__user=user,
+                    set__inspired_by=inspired_by, set__created=timezone.now())
 
-        if created is False:
-            raise AlreadyExistsError("User '%s' already follows '%s'" % (follower, followee))
+        if relation is not None:
+            raise AlreadyExistsError("User '%s' already inspired by '%s'" % (user, inspired_by))
 
-        follower_created.send(sender=self, follower=follower)
-        following_created.send(sender=self, follow=followee)
+        relation = Inspiration.objects(user=user, inspired_by=inspired_by).first()
 
-        bust_cache('followers', followee.pk)
-        bust_cache('following', follower.pk)
+        inspirations_created.send(sender=self, user=user)
+        inspirationals_created.send(sender=self, inspired_by=inspired_by)
+
+        bust_cache('inspirations', inspired_by.pk)
+        bust_cache('inspirationals', user.pk)
 
         return relation
 
-    def remove_follower(self, follower, followee):
-        """ Remove 'follower' follows 'followee' relationship """
+    def remove_inspiration(self, user, inspired_by):
+        """ Remove 'user' inspired by 'inspired_by' relationship """
         try:
-            rel = Follow.objects.get(follower=follower, followee=followee)
-            follower_removed.send(sender=rel, follower=rel.follower)
-            following_removed.send(sender=rel, following=rel.followee)
+            rel = Inspiration.objects.get(user=user, inspired_by=inspired_by)
+            inspirations_removed.send(sender=rel, user=rel.user)
+            inspirationals_removed.send(sender=rel, inspired_by=rel.inspired_by)
             rel.delete()
-            bust_cache('followers', followee.pk)
-            bust_cache('following', follower.pk)
+            bust_cache('inspirations', inspired_by.pk)
+            bust_cache('inspirationals', user.pk)
             return True
-        except Follow.DoesNotExist:
+        except Inspiration.DoesNotExist:
             return False
 
-    def follows(self, follower, followee):
-        """ Does follower follow followee? Smartly uses caches if exists """
-        followers = cache.get(cache_key('following', follower.pk))
-        following = cache.get(cache_key('followers', followee.pk))
+    def is_inspired(self, user, inspired_by):
+        """ Does user inspired by inspirational? Smartly uses caches if exists """
+        inspirations = cache.get(cache_key('inspirationals', user.pk))
+        inspirationals = cache.get(cache_key('inspirations', inspired_by.pk))
 
-        if followers and followee in followers:
+        if inspirations and inspired_by in inspirations:
             return True
-        elif following and follower in following:
+        elif inspirationals and user in inspirationals:
             return True
         else:
             try:
-                Follow.objects.get(follower=follower, followee=followee)
+                Inspiration.objects.get(user=user, inspired_by=inspired_by)
                 return True
-            except Follow.DoesNotExist:
+            except Inspiration.DoesNotExist:
                 return False
 
 
-class Follow(models.Model):
-    """ Model to represent Following relationships """
-    follower = models.ForeignKey(AUTH_USER_MODEL, related_name='following')
-    followee = models.ForeignKey(AUTH_USER_MODEL, related_name='followers')
-    created = models.DateTimeField(default=timezone.now)
+@python_2_unicode_compatible
+class Inspiration(Document):
+    """
+    Model to represent Inspiration relationships
 
-    objects = FollowingManager()
+    Notes:
+    - inspirations (followers) - people who inspired by me (user)
+            (Inspiration.objects(inspired_by=user).only('user'))
+    - inspirationals (following) - people who inspire the user
+            (Inspiration.objects(user=user).only('inspired_by'))
+
+    TODO:
+    1) ensure that (user, inspired_by) and (inspired_by, user) are not the same;
+    """
+    user = fields.ReferenceField(get_user_model())
+    inspired_by = fields.ReferenceField(get_user_model(), unique_with='user')
+    created = fields.DateTimeField(default=timezone.now, null=True)
+
+    meta = {
+        'indexes': [
+            'user',
+            'inspired_by',
+            ('user', 'inspired_by'),
+        ],
+        'queryset_class': InspirationQuerySet
+    }
 
     class Meta:
-        verbose_name = _('Following Relationship')
-        verbose_name_plural = _('Following Relationships')
-        unique_together = ('follower', 'followee')
+        verbose_name = _('Inspiration Relationship')
+        verbose_name_plural = _('Inspiration Relationships')
 
-    def __unicode__(self):
-        return "User #%d follows #%d" % (self.follower_id, self.followee_id)
+    def __str__(self):
+        return "User #%s inspired by #%s" % (self.user.pk, self.inspired_by.pk)
 
     def save(self, *args, **kwargs):
-        # Ensure users can't be friends with themselves
-        if self.follower == self.followee:
-            raise ValidationError("Users cannot follow themselves.")
-        super(Follow, self).save(*args, **kwargs)
+        # Ensure users can't be inspired by themselves
+        if self.user == self.inspired_by:
+            raise ValidationError("Users cannot inspire themselves.")
+
+        return super(Inspiration, self).save(*args, **kwargs)
+
+
+class BlockingQuerySet(QuerySet):
+
+    def blocked_for_user(self, user):
+        key = cache_key('blocked', user.pk)
+        blocked = cache.get(key)
+
+        if blocked is None:
+            qs = Blocking.objects.filter(from_user=user).select_related(max_depth=2)
+            blocked = [u.to_user for u in qs]
+            cache.set(key, blocked)
+
+        return blocked
+
+    def add_blocking(self, from_user, to_user):
+        """ Create 'from_user' blocked 'to_user' relationship """
+        if from_user == to_user:
+            raise ValidationError("Users cannot block themselves")
+
+        relation = Blocking.objects(from_user=from_user, to_user=to_user)\
+            .modify(new=False, upsert=True, set__from_user=from_user,
+                    set__to_user=to_user, set__created=timezone.now())
+
+        Friend.objects.remove_friend(from_user, to_user)
+
+        # reject all requests from `to_user`
+        to_user_requests = FriendshipRequest.objects.filter(
+            from_user=to_user,
+            to_user=from_user)
+
+        for req in to_user_requests:
+            req.reject()
+
+        # .. and cancel all requests from 'from_user' to 'to_user'
+        from_user_requests = FriendshipRequest.objects.filter(
+            from_user=from_user,
+            to_user=to_user)
+
+        for req in from_user_requests:
+            req.cancel()
+
+        if relation is not None:
+            raise AlreadyExistsError("User '%s' already blocked '%s'" % (from_user, to_user))
+
+        relation = Blocking.objects(from_user=from_user, to_user=to_user).first()
+
+        blocking_created.send(sender=self, from_user=from_user, to_user=to_user)
+
+        bust_cache('blocked', from_user.pk)
+
+        return relation
+
+    def remove_blocking(self, from_user, to_user):
+        """ Remove 'user' blocked 'to_user' relationship """
+        try:
+            rel = Blocking.objects.get(from_user=from_user, to_user=to_user)
+            blocking_removed.send(sender=rel, from_user=rel.from_user, to_user=rel.to_user)
+            rel.delete()
+            bust_cache('blocked', from_user.pk)
+            return True
+        except Blocking.DoesNotExist:
+            return False
+
+    def is_blocked(self, from_user, to_user):
+        """ Is to_user blocked by from_user? """
+        blocked = cache.get(cache_key('blocked', from_user.pk))
+        if blocked and to_user in blocked:
+            return True
+        else:
+            try:
+                Blocking.objects.get(from_user=from_user, to_user=to_user)
+                return True
+            except Blocking.DoesNotExist:
+                return False
+
+
+@python_2_unicode_compatible
+class Blocking(Document):
+    """
+    A blocking is used to block user from sending invitations to another user
+    (to protect from invitation spamming).
+    """
+
+    from_user = fields.ReferenceField(
+        get_user_model(),
+        verbose_name=_("from user"))
+    to_user = fields.ReferenceField(
+        get_user_model(),
+        unique_with='from_user',
+        verbose_name=_("to user"))
+    created = fields.DateTimeField(
+        verbose_name=_("created"),
+        default=timezone.now)
+
+    meta = {
+        'indexes': [
+            'from_user',
+            'to_user',
+            ('from_user', 'to_user')
+        ],
+        'queryset_class': BlockingQuerySet
+    }
+
+    def __str__(self):
+        return "User #{} blocked #{}".format(
+            self.from_user, self.to_user)
+
+
+
+# signals receivers to send notifications
+
+if "notification" in settings.INSTALLED_APPS:
+    from notification import models as notification
+else:
+    notification = None
+
+def send_request_sent_notification(sender, instance, created, **kwargs):
+    if notification and created:
+        notification.send([instance.to_user],
+            "friendship_request", {"request": instance})
+        notification.send([instance.from_user],
+            "friendship_request_sent", {"request": instance})
+
+def send_acceptance_sent_notification(sender, instance, created, **kwargs):
+    if notification and created:
+        notification.send([instance.to_user],
+            "friendship_accept_sent", {"from_user": instance.from_user})
+        notification.send([instance.from_user],
+            "friendship_accept", {"to_user": instance.to_user})
+
+def send_otherconnect_notification(sender, instance, created, **kwargs):
+    if notification and created:
+        for user in Friend.objects.friends(instance.to_user):
+            if user != instance.from_user:
+                notification.send([user],
+                    "friendship_otherconnect",
+                    {"your_friend": instance.to_user,
+                    "new_friend": instance.from_user})
+
+        for user in Friend.objects.friends(instance.from_user):
+            if user != instance.to_user:
+                notification.send([user],
+                    "friendship_otherconnect",
+                    {"your_friend": instance.from_user,
+                    "new_friend": instance.to_user})
+
+def send_friend_removed_notification(sender, instance, **kwargs):
+    if notification:
+        notification.send([instance.to_user],
+            "friendship_friend_removed",
+            {"removed_friend": instance.from_user})
+
+        notification.send([instance.from_user],
+            "friendship_friend_removed",
+            {"removed_friend": instance.to_user})
+
+
+
+if notification and USE_NOTIFICATION_APP:
+
+    signals.post_save.connect(
+        send_request_sent_notification,
+        sender=FriendshipRequest,
+        dispatch_uid="friendship_send_request_sent_notification")
+
+    signals.post_save.connect(
+        send_acceptance_sent_notification,
+        sender=Friend,
+        dispatch_uid="friendship_send_acceptance_sent_notification")
+
+    if NOTIFY_ABOUT_NEW_FRIENDS_OF_FRIEND:
+        signals.post_save.connect(
+            send_otherconnect_notification,
+            sender=Friend,
+            dispatch_uid="friendship_send_otherconnect_notification")
+
+    if NOTIFY_ABOUT_FRIENDS_REMOVAL:
+        signals.pre_delete.connect(
+            send_friend_removed_notification,
+            sender=Friend,
+            dispatch_uid="friendship_send_friend_removed_notification")

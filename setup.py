@@ -28,6 +28,5 @@ setup(
         'Programming Language :: Python :: 2',
         'Programming Language :: Python :: 3',
         'Framework :: Django',
-    ],
-    test_suite='friendship.tests.runtests.runtests'
+    ]
 )

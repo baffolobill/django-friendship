@@ -1,3 +1,1 @@
-include setup.py README.rst MANIFEST.in LICENSE.txt requirements.txt AUTHORS.txt
-recursive-include friendship/templates *
-recursive-include friendship/tests/templates *
+include setup.py README.rst MANIFEST.in LICENSE.txt AUTHORS.txt

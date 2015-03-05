@@ -1,3 +1,22 @@
+Distinctions
+============
+
+* overwritten for ``MongoEngine``
+* only business logic: no views, templates, templatetags and urls
+* added ``Blocking`` model: users in that model cannot be added to friends
+* added compat.py
+* Follow was replaced by Inspiration
+* initial support for django-notification (https://github.com/jtauber/django-notification): supports only friends relations now
+
+
+TODO
+====
+
+- full support of django-notification: Blocking and Inspiration
+- add suggestion feature (like in https://github.com/Thinktiv/django-easy-friends)
+
+
+
 django-friendship
 =================
 
@@ -12,8 +31,8 @@ Add ``friendship`` to ``INSTALLED_APPS`` and run ``syncdb``.
 
 To use ``django-friendship`` in your views::
 
-    from django.contrib.auth.models import User
-    from friendship.models import Friend, Follow
+    from path_to_your_custom_user.models import User
+    from friendship.models import Friend, Inspiration
 
     def my_view(request):
         # List of this user's friends
@@ -38,15 +57,15 @@ To use ``django-friendship`` in your views::
         sent = Friend.objects.sent_requests(user=request.user)
 
         # List of this user's followers
-        all_followers = Following.objects.followers(request.user)
+        all_followers = Inspiration.objects.inspired_by_user(request.user)
 
         # List of who this user is following
-        following = Following.objects.following(request.user)
+        following = Inspiration.objects.user_inspired_by(request.user)
 
         ### Managing friendship relationships
 
         # Create a friendship request
-        other_user = User.objects.get(pk=1)
+        other_user = User.objects.all()[0]
         new_relationship = Friend.objects.add_friend(request.user, other_user)
 
         # Can optionally save a message when creating friend requests
@@ -66,16 +85,7 @@ To use ``django-friendship`` in your views::
         Friend.objects.remove_friend(other_user, request.user)
 
         # Create request.user follows other_user relationship
-        following_created = Following.objects.add_follower(request.user, other_user)
-
-To use ``django-friendship`` in your templates::
-
-   {% load friendshiptags %}
-
-   {% friends request.user %}
-   {% followers request.user %}
-   {% following request.user %}
-   {% friend_requests request.user %}
+        following_created = Inspiration.objects.add_inspiration(request.user, other_user)
 
 Signals
 =======
@@ -87,14 +97,14 @@ Signals
 * friendship_request_canceled
 * friendship_request_accepted
 * friendship_removed
-* follower_created
-* following_created
-* follower_removed
-* following_removed
+* blocking_created
+* blocking_removed
+* inspirations_created
+* inspirations_removed
+* inspirationals_created
+* inspirationals_removed
 
 Compatibility
 =============
 
-This package requires Django 1.4 and above since v0.9.0. It is currently tested by Travis-CI against 1.4.12, 1.5.7, 1.6.4, and 1.7b1.
-
-The last release supporting Django 1.3 is v0.8.3.
+This package requires Django 1.6 and above.
