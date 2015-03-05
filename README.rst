@@ -16,14 +16,6 @@ TODO
 - add suggestion feature (like in https://github.com/Thinktiv/django-easy-friends)
 
 
-
-django-friendship
-=================
-
-.. image:: https://secure.travis-ci.org/revsys/django-friendship.png
-    :alt: Build Status
-    :target: http://travis-ci.org/revsys/django-friendship
-
 Usage
 =====
 
